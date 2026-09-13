@@ -2205,6 +2205,19 @@ async fn handle_notification(
             handle_relay_exec(notif, ctx, dispatch_table, fd).await;
             return;
         }
+        // Fence the relay's pin fd: refuse a dup2/dup3 onto a fd pinned by an
+        // in-flight exec, so the relay memfd cannot be swapped before the
+        // kernel opens it. Outside a hold this is a plain Continue.
+        if policy.argv_safety_required
+            && (nr == libc::SYS_dup3 || Some(nr) == crate::arch::sys_dup2())
+        {
+            let action = match crate::exec_relay::guard_dup(&notif, &ctx.exec_relay) {
+                Ok(()) => NotifAction::Continue,
+                Err(errno) => NotifAction::Errno(errno),
+            };
+            let _ = send_response(fd, notif.id, action);
+            return;
+        }
     }
 
     // Check dynamic path denials before dispatch. The gated syscall set is

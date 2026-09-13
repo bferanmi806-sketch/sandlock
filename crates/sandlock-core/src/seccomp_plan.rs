@@ -361,6 +361,16 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     let mut nrs = SyscallList::with(BASE_NOTIF_SYSCALLS);
     nrs.push_optional(arch::sys_vfork());
 
+    // Under argv safety the exec relay pins its memfd at a fd K and rewrites
+    // the exec to /dev/fd/K. Only dup2/dup3 can force another file onto an
+    // already-occupied fd, so they are trapped and one whose newfd is a pinned
+    // K is refused while an exec is in flight (`guard_dup`). dup3 is the
+    // generic-ABI syscall (all arches); dup2 exists only on legacy (x86_64).
+    if features.argv_safety_required {
+        nrs.push(libc::SYS_dup3);
+        nrs.push_optional(arch::sys_dup2());
+    }
+
     if features.memory_limit {
         nrs.extend(MEMORY_NOTIF_SYSCALLS);
         // shmget is in notif only when SysV IPC is allowed. The BPF

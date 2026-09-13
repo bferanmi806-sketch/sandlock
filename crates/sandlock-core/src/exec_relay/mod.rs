@@ -8,12 +8,21 @@
 //! saw, read from a trailer on its own image. See `relay.c` for the child side.
 //!
 //! The memfd is installed at a free fd K just below the child's soft
-//! RLIMIT_NOFILE and the soft limit is then set to K until the relay runs:
-//! no dup2, open, F_DUPFD, SCM_RIGHTS or pidfd_getfd in the sandbox can
-//! place a different file at K, so the sibling that could rewrite argv
-//! cannot swap the program either. The child's path is rewritten in place
-//! to `/dev/fd/K`, kept short because the bytes after a short path are
-//! often the argv pointer array, which cannot move.
+//! RLIMIT_NOFILE and the child's path is rewritten in place to `/dev/fd/K`,
+//! kept short because the bytes after a short path are often the argv pointer
+//! array, which cannot move.
+//!
+//! K must stay the relay memfd from the install until the kernel opens it for
+//! the exec. Of every fd-creating syscall, only `dup2` and `dup3` can force a
+//! file onto an *already-occupied* descriptor; `open`, `F_DUPFD`, SCM_RIGHTS
+//! and `pidfd_getfd` all take the lowest free number and cannot land on K.
+//! So `dup2`/`dup3` are trapped under argv safety and, while an exec is in
+//! flight, one whose `newfd` is a pinned K is refused (`guard_dup`). Their
+//! `newfd` is a register argument, not child memory, so the check cannot be
+//! raced, and it is keyed on the fd rather than a per-process limit, so it
+//! also covers a `CLONE_FILES` peer that shares the fd table with its own
+//! rlimit. The hold that arms the refusal is recorded before the install, so
+//! there is no window in which K is live but unguarded.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -176,7 +185,8 @@ impl ExecRequest {
 
 struct Hold {
     memfd_ident: (u64, u64),
-    old_soft: u64,
+    /// The pinned fd. A `dup2`/`dup3` onto it is refused while the hold stands.
+    k: i32,
 }
 
 /// Per-tgid record of a relay exec in flight, from commit until the relay's
@@ -201,8 +211,38 @@ impl RelayState {
             None => false,
         }
     }
+
+    /// Whether `newfd` is the pinned fd of any exec currently in flight, i.e.
+    /// a `dup2`/`dup3` onto it would swap the relay memfd out. See `guard_dup`.
+    fn is_pinned_fd(&self, newfd: i32) -> bool {
+        let holds = self.holds.lock().unwrap();
+        !holds.is_empty() && holds.values().any(|h| h.k == newfd)
+    }
 }
 
+/// Decision for a trapped `dup2`/`dup3`: refuse it when `newfd` is a fd pinned
+/// by an in-flight exec, so the sandbox cannot replace the relay memfd between
+/// the supervisor installing it and the kernel opening it. `newfd` is a
+/// register argument (dup2(oldfd, newfd) / dup3(oldfd, newfd, flags)), not
+/// child memory, so this cannot be raced; keying on the fd rather than a
+/// per-process rlimit also covers a `CLONE_FILES` peer sharing the fd table.
+pub(crate) fn guard_dup(notif: &SeccompNotif, relay: &RelayState) -> Result<(), i32> {
+    let newfd = notif.data.args[1] as i64;
+    if (0..=i32::MAX as i64).contains(&newfd) && relay.is_pinned_fd(newfd as i32) {
+        return Err(libc::EPERM);
+    }
+    Ok(())
+}
+
+/// Decision for a trapped `prlimit64`/`setrlimit`: refuse an `RLIMIT_NOFILE`
+/// change to a tgid whose exec is in flight, so the sandbox cannot raise the
+/// soft limit back and place another file at the pinned fd; otherwise let the
+/// kernel run it. `resource` and the `new_limit` presence come from register
+/// args, not child memory, so this decision cannot be raced.
+///
+/// The syscalls are trapped for the whole run (seccomp cannot arm a filter for
+/// just the exec window), so the common case — no exec in flight — returns on a
+/// single lock-guarded emptiness check, before touching args or `/proc`.
 pub(crate) enum Prepared {
     /// The relay's own execve: already judged, let the exec handlers run it.
     SecondExec,
@@ -224,22 +264,13 @@ fn ident_of(path: &Path) -> Option<(u64, u64)> {
     std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
-fn nofile_limits(pid: i32) -> io::Result<(u64, u64)> {
+fn nofile_soft(pid: i32) -> io::Result<u64> {
     let mut old = libc::rlimit64 { rlim_cur: 0, rlim_max: 0 };
     let r = unsafe { libc::prlimit64(pid, libc::RLIMIT_NOFILE, std::ptr::null(), &mut old) };
     if r != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((old.rlim_cur, old.rlim_max))
-}
-
-fn set_soft_nofile(pid: i32, soft: u64, hard: u64) -> io::Result<()> {
-    let new = libc::rlimit64 { rlim_cur: soft, rlim_max: hard };
-    let r = unsafe { libc::prlimit64(pid, libc::RLIMIT_NOFILE, &new, std::ptr::null_mut()) };
-    if r != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    Ok(old.rlim_cur)
 }
 
 /// Step one of a policy-checked exec: recognise the relay's own execve, or
@@ -257,9 +288,6 @@ pub(crate) async fn prepare(
     let hold = ctx.exec_relay.holds.lock().unwrap().remove(&tgid);
     if let Some(hold) = hold {
         let ours = ident_of(Path::new(&format!("/proc/{pid}/exe"))) == Some(hold.memfd_ident);
-        if let Ok((_, hard)) = nofile_limits(tgid) {
-            let _ = set_soft_nofile(tgid, hold.old_soft.min(hard), hard);
-        }
         if ours {
             return Ok(Prepared::SecondExec);
         }
@@ -468,25 +496,29 @@ fn sealed_memfd(image: &[u8]) -> io::Result<OwnedFd> {
 pub(crate) fn commit(pending: PendingExec, notif: &SeccompNotif, notif_fd: RawFd, ctx: &Arc<SupervisorCtx>) -> Result<(), i32> {
     let pid = notif.pid as i32;
     let PendingExec { request, args, tgid } = pending;
-    let (soft, hard) = nofile_limits(tgid).map_err(|e| errno_of(&e))?;
+    let soft = nofile_soft(tgid).map_err(|e| errno_of(&e))?;
     // Seven digits keep "/dev/fd/K" within 16 bytes; a free slot just below
-    // the soft limit is almost never in use.
-    let top = soft.min(hard).min(10_000_000);
+    // the soft limit is almost never in use, and ADDFD needs newfd < soft.
+    let top = soft.min(10_000_000);
     if top < 32 {
         return Err(libc::EAGAIN);
     }
     let k = (top - 16..top)
         .rev()
         .find(|k| std::fs::symlink_metadata(format!("/proc/{pid}/fd/{k}")).is_err())
-        .ok_or(libc::EAGAIN)?;
+        .ok_or(libc::EAGAIN)? as i32;
     let k_link = format!("/proc/{pid}/fd/{k}");
-    let image = build_image(&args, k as i32).map_err(|e| errno_of(&e))?;
+    let image = build_image(&args, k).map_err(|e| errno_of(&e))?;
     let memfd = sealed_memfd(&image).map_err(|e| errno_of(&e))?;
     let ident = std::fs::metadata(format!("/proc/self/fd/{}", memfd.as_raw_fd()))
         .map(|m| (m.dev(), m.ino()))
         .map_err(|e| errno_of(&e))?;
 
-    let restore = || { let _ = set_soft_nofile(tgid, soft, hard); };
+    // Arm the hold before the install so `guard_dup` fences K for the whole
+    // window; drop it on any failure below.
+    ctx.exec_relay.holds.lock().unwrap().insert(tgid, Hold { memfd_ident: ident, k });
+    let unwind = || { ctx.exec_relay.holds.lock().unwrap().remove(&tgid); };
+
     let addfd = SeccompNotifAddfd {
         id: notif.id,
         flags: SECCOMP_ADDFD_FLAG_SETFD,
@@ -496,33 +528,58 @@ pub(crate) fn commit(pending: PendingExec, notif: &SeccompNotif, notif_fd: RawFd
     };
     let installed = unsafe { libc::ioctl(notif_fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::Ioctl, &addfd as *const _) };
     if installed < 0 {
-        restore();
+        unwind();
         return Err(libc::EAGAIN);
     }
-    if let Err(e) = set_soft_nofile(tgid, k, hard) {
-        restore();
-        return Err(errno_of(&e));
-    }
-    // Nothing in the sandbox can change fd K from here on, so this check
-    // settles what the kernel will open.
+    // ADDFD force-installed our memfd at K and dup2/dup3 onto K are now refused,
+    // so this settles what the kernel will open.
     if ident_of(Path::new(&k_link)) != Some(ident) {
-        restore();
+        unwind();
         return Err(libc::EAGAIN);
     }
     let new_path = format!("{}/{k}\0", fd_dir());
     if rewrite_exec_path(
         notif_fd, notif.id, notif.pid, request.path_ptr, request.argv_ptr, request.envp_ptr, new_path.as_bytes(),
     ).is_err() {
-        restore();
+        unwind();
         return Err(libc::EFAULT);
     }
-    ctx.exec_relay.holds.lock().unwrap().insert(tgid, Hold { memfd_ident: ident, old_soft: soft });
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sys::structs::SeccompData;
+
+    fn notif(nr: i64, args: [u64; 6], pid: u32) -> SeccompNotif {
+        SeccompNotif {
+            id: 1,
+            pid,
+            flags: 0,
+            data: SeccompData { nr: nr as i32, arch: 0, instruction_pointer: 0, args },
+        }
+    }
+
+    #[test]
+    fn guard_refuses_dup_onto_a_pinned_fd_only_while_a_hold_is_active() {
+        let relay = RelayState::default();
+        let tgid = std::process::id() as i32;
+        const K: i32 = 1_048_560;
+        let dup3 = crate::arch::sys_dup2().unwrap_or(libc::SYS_dup3);
+        // dup2/dup3(oldfd, newfd, ..): newfd is args[1].
+        let onto_k = notif(dup3, [0, K as u64, 0, 0, 0, 0], tgid as u32);
+        let onto_other = notif(dup3, [0, 5, 0, 0, 0, 0], tgid as u32);
+
+        assert!(guard_dup(&onto_k, &relay).is_ok(), "no hold: allowed");
+
+        relay.holds.lock().unwrap().insert(tgid, Hold { memfd_ident: (0, 0), k: K });
+        assert_eq!(guard_dup(&onto_k, &relay), Err(libc::EPERM), "hold: dup onto K refused");
+        assert!(guard_dup(&onto_other, &relay).is_ok(), "hold: dup onto other fd allowed");
+
+        relay.holds.lock().unwrap().remove(&tgid);
+        assert!(guard_dup(&onto_k, &relay).is_ok(), "hold cleared: allowed again");
+    }
 
     fn sample(mode: ArgsMode) -> ExecArgs {
         ExecArgs {

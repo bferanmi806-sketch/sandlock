@@ -185,21 +185,38 @@ async fn threads_spawning_subprocesses_all_succeed() {
     assert_eq!(stdout_of(&r), "SPAWNS 80", "stderr: {}", stderr_of(&r));
 }
 
-/// The relay borrows the soft NOFILE limit to pin its fd; the program that
-/// finally runs must see the limit it would have had.
+/// The relay no longer touches RLIMIT_NOFILE, so the program that runs sees the
+/// limit it would have had.
 #[tokio::test]
-async fn soft_nofile_limit_is_restored_for_the_program() {
-    let outside = std::process::Command::new("sh").args(["-c", "ulimit -Sn"]).output().unwrap();
+async fn nofile_limit_is_untouched_for_the_program() {
+    let outside = std::process::Command::new("sh").args(["-c", "ulimit -Sn; ulimit -Hn"]).output().unwrap();
     let outside = String::from_utf8_lossy(&outside.stdout).trim().to_string();
     let policy = base_policy().policy_fn(|_e, _c| Verdict::Allow).build().unwrap();
-    let r = policy.clone().run(&["sh", "-c", "ulimit -Sn"]).await.unwrap();
+    let r = policy.clone().run(&["sh", "-c", "ulimit -Sn; ulimit -Hn"]).await.unwrap();
     assert_eq!(stdout_of(&r), outside);
 }
 
-/// A process sharing its fd table with another process could repopulate the
-/// pinned fd number, so that clone shape is refused under an argv policy.
+/// The relay fences its pin fd by refusing dup2/dup3 onto it, so a program not
+/// mid-exec must still be able to dup2 onto an arbitrary high fd normally.
 #[tokio::test]
-async fn clone_files_without_thread_is_rejected() {
+async fn program_can_dup2_onto_a_high_fd() {
+    let policy = base_policy().policy_fn(|_e, _c| Verdict::Allow).build().unwrap();
+    let script = concat!(
+        "import os, resource\n",
+        "soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)\n",
+        "k = soft - 100\n",           // near where the relay would pin, but no exec in flight
+        "os.dup2(0, k)\n",
+        "print('DUP2_OK' if os.fstat(k) else 'NO')\n",
+    );
+    let r = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    assert_eq!(stdout_of(&r), "DUP2_OK", "stderr: {}", stderr_of(&r));
+}
+
+/// The pin is fenced per-fd, not per-process, so a CLONE_FILES peer that shares
+/// the fd table with its own rlimit is no longer a threat and that clone shape
+/// is now allowed to run.
+#[tokio::test]
+async fn clone_files_without_thread_is_allowed() {
     let policy = base_policy().policy_fn(|_e, _c| Verdict::Allow).build().unwrap();
     let script = concat!(
         "import ctypes, os, platform\n",
@@ -208,10 +225,10 @@ async fn clone_files_without_thread_is_rejected() {
         "nr = 56 if platform.machine() == 'x86_64' else 220\n",
         "r = libc.syscall(nr, CLONE_FILES | SIGCHLD, 0, 0, 0, 0)\n",
         "if r == 0: os._exit(0)\n",
-        "print('EINVAL' if r < 0 and ctypes.get_errno() == 22 else 'RET %d' % r)\n",
+        "print('OK' if r > 0 else 'ERR %d' % ctypes.get_errno())\n",
     );
     let r = policy.clone().run(&["python3", "-c", script]).await.unwrap();
-    assert_eq!(stdout_of(&r), "EINVAL", "stderr: {}", stderr_of(&r));
+    assert_eq!(stdout_of(&r), "OK", "stderr: {}", stderr_of(&r));
 }
 
 /// Under chroot the relay hands the child's virtual path to the chroot exec

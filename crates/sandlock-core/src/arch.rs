@@ -75,6 +75,7 @@ legacy_syscall!(sys_chown, "chown");
 legacy_syscall!(sys_lchown, "lchown");
 legacy_syscall!(sys_vfork, "vfork");
 legacy_syscall!(sys_fork, "fork");
+legacy_syscall!(sys_dup2, "dup2");
 
 /// `renameat` syscall number on this architecture, or `None` where the ABI
 /// omits it. Unlike the legacy syscalls above it survived into the generic

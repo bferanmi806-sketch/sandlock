@@ -25,7 +25,6 @@ use crate::sys::structs::{
 
 /// CLONE_THREAD flag — threads don't count toward process limit.
 const CLONE_THREAD: u64 = 0x0001_0000;
-const CLONE_FILES: u64 = 0x0000_0400;
 
 /// MAP_ANONYMOUS flag: anonymous and writable private file mappings count.
 const MAP_ANONYMOUS: u64 = 0x20;
@@ -40,9 +39,8 @@ const MAP_ANONYMOUS: u64 = 0x20;
 /// TOCTOU note: the `clone3` read is from racy user memory — a sibling
 /// thread could mutate the struct between this read and the kernel's
 /// re-read after `Continue`. Callers use this only for resource
-/// accounting (`proc_count`, the CLONE_FILES gate), never as a
-/// security boundary, so a misread can throttle incorrectly but cannot
-/// bypass any kernel-enforced deny.
+/// accounting (`proc_count`), never as a security boundary, so a misread
+/// can throttle incorrectly but cannot bypass any kernel-enforced deny.
 fn clone_flags(notif: &SeccompNotif, notif_fd: RawFd) -> Option<u64> {
     let args = &notif.data.args;
     let nr = notif.data.nr as i64;
@@ -84,20 +82,9 @@ pub(crate) async fn handle_fork(
     notif: &SeccompNotif,
     notif_fd: RawFd,
     ctx: &Arc<SupervisorCtx>,
-    policy: &NotifPolicy,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
     let args = &notif.data.args;
-
-    // The exec relay pins its fd through the caller's RLIMIT_NOFILE, which a
-    // process sharing the fd table without sharing the limit could defeat.
-    if policy.argv_safety_required {
-        if let Some(flags) = clone_flags(notif, notif_fd) {
-            if flags & CLONE_FILES != 0 && flags & CLONE_THREAD == 0 {
-                return NotifAction::Errno(libc::EINVAL);
-            }
-        }
-    }
 
     // Namespace flags are denied for clone (clone3's are caught by the
     // BPF arg filter; vfork takes no flags).
