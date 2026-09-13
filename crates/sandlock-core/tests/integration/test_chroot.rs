@@ -2066,7 +2066,9 @@ async fn test_chroot_hardlink_into_a_branch_is_refused() {
                 r.stderr_str().unwrap_or("")
             );
             assert!(
-                r.stderr_str().unwrap_or("").contains("Invalid cross-device link"),
+                // glibc says "Invalid cross-device link", musl says "Cross-device link";
+                // the fixture links whichever static libc build.rs found.
+                r.stderr_str().unwrap_or("").contains("ross-device link"),
                 "the refusal should read as a cross-device link, stderr={}",
                 r.stderr_str().unwrap_or("")
             );
