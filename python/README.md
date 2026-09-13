@@ -99,7 +99,7 @@ with Sandbox(fs_readable=["/usr", "/lib"]) as sb:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `fs_readable` | `list[str]` | `[]` | Paths the sandbox can read |
-| `fs_writable` | `list[str]` | `[]` | Paths the sandbox can write |
+| `fs_writable` | `list[str]` | `[]` | Paths the sandbox can read and write |
 | `fs_denied` | `list[str]` | `[]` | Paths explicitly denied |
 | `workdir` | `str \| None` | `None` | Working directory; enables COW protection |
 | `chroot` | `str \| None` | `None` | Path to chroot into before confinement |
@@ -746,7 +746,7 @@ permissions explicitly:
 
 | Capability | Example | Description |
 |------------|---------|-------------|
-| `fs_writable` | `["/tmp/agent"]` | Paths the tool can write to |
+| `fs_writable` | `["/tmp/agent"]` | Paths the tool can read and write |
 | `net_allow` | `["api.example.com:443", "udp://1.1.1.1:53"]` | Outbound endpoints. Bare `host:port` is TCP; `udp://...` / `icmp://...` schemes opt UDP / ICMP echo in. |
 | `env` | `{"KEY": "val"}` | Environment variables to pass |
 | `max_memory` | `"256M"` | Memory limit |
