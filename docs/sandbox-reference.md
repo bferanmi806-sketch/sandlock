@@ -334,8 +334,7 @@ traffic. Protocol gating falls out of rule presence: without a UDP
 rule, UDP socket creation is denied at the seccomp layer; without an
 ICMP rule, kernel ping socket creation is denied. A scheme-less rule
 counts for both TCP and UDP; ICMP always needs `icmp://`. Raw ICMP (`SOCK_RAW
-+ IPPROTO_ICMP`) is never exposed. See the project README's "Network
-Model" section for the full grammar.
++ IPPROTO_ICMP`) is never exposed. See [`network.md`](network.md) for the full grammar.
 
 Rule shapes:
 
@@ -410,7 +409,7 @@ and have no TOML counterpart.
 | Field       | Type              | Default | Description                                                                                                |
 | ----------- | ----------------- | ------- | ---------------------------------------------------------------------------------------------------------- |
 | `name`      | `str \| None`     | `None`  | Sandbox name and virtual hostname inside the sandbox. Auto-generated as `sandbox-{pid}` when omitted. Maximum 64 bytes; must not contain NUL. |
-| `policy_fn` | `Callable \| None`| `None`  | Per-event dynamic policy callback. See the project README's "Dynamic Policy" section.                      |
+| `policy_fn` | `Callable \| None`| `None`  | Per-event dynamic policy callback. See [`policy-fn.md`](policy-fn.md).                      |
 | `init_fn`   | `Callable \| None`| `None`  | Callback invoked once in the template process prior to COW fork.                                           |
 | `work_fn`   | `Callable \| None`| `None`  | Callback invoked in each COW clone; receives `clone_id` as its argument.                                   |
 
