@@ -108,4 +108,5 @@ those static rules; use `ctx.deny_path()` for runtime additions.
 
 Dynamic network restrictions are IP-only and resolve with legacy priority
 (per-PID override > live policy > static allowlist); the static `net_deny`
-layer is always checked first, so a dynamic override can never erase it.
+layer is applied after the allow verdict and always wins, so a dynamic
+override can never erase it.

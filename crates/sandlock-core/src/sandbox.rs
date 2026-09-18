@@ -750,6 +750,22 @@ impl Sandbox {
         self.net_deny_bind.is_empty() || !self.net_allow_bind.is_default()
     }
 
+    /// Resolve the on-behalf bind allow layer for the supervisor.
+    ///
+    /// Installed only while the NetTcp protection is active: `bind()` can
+    /// still reach the on-behalf handler when NetTcp is disabled or degraded
+    /// (port remap, destination supervision), and without this gate the
+    /// default/explicit allowlist would deny every TCP bind even though the
+    /// protection is off. The denylist is populated and enforced
+    /// independently of this layer.
+    pub(crate) fn bind_allow_layer(&self, net_tcp_active: bool) -> Option<BindPorts> {
+        if net_tcp_active && self.bind_allow_is_active() {
+            Some(self.net_allow_bind.clone())
+        } else {
+            None
+        }
+    }
+
     /// Validate cross-section invariants — checks that span multiple fields.
     ///
     /// Currently a no-op; retained as an extension point and for API
@@ -2213,11 +2229,10 @@ impl Sandbox {
             net_state.http_acl_addr = self.rt().http_acl_handle.as_ref().map(|h| h.addr);
             net_state.http_acl_ports = self.http_ports.iter().copied().collect();
             net_state.http_acl_orig_dest = self.rt().http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
-            net_state.bind_allow_ports = if self.bind_allow_is_active() {
-                Some(self.net_allow_bind.clone())
-            } else {
-                None
-            };
+            let net_tcp_active = self.active_protections()?
+                .into_iter()
+                .any(|(p, s)| p == Protection::NetTcp && s == ProtectionStatus::Active);
+            net_state.bind_allow_ports = self.bind_allow_layer(net_tcp_active);
             net_state.bind_deny_ports = self.net_deny_bind.iter().copied().collect();
             if let Some(cb) = self.rt_mut().on_bind.take() {
                 net_state.port_map.on_bind = Some(cb);

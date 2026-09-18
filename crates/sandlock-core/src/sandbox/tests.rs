@@ -388,6 +388,76 @@ fn bind_allow_port_zero_is_ephemeral_only() {
 }
 
 #[test]
+fn bind_allow_layer_is_not_installed_without_active_net_tcp() {
+    // bind() can still reach the on-behalf handler when NetTcp is disabled
+    // or degraded (port remap, destination supervision). The allow layer
+    // must not be installed then: otherwise the default empty allowlist
+    // would deny every TCP bind even though the protection is off. This
+    // holds for default, explicit-allow, combined, and deny-only bind
+    // policies alike.
+    for builder in [
+        Sandbox::builder().port_remap(true),
+        Sandbox::builder().port_remap(true).net_allow_bind("8080"),
+        Sandbox::builder()
+            .port_remap(true)
+            .net_allow_bind("8080")
+            .net_deny_bind("9090"),
+        Sandbox::builder().port_remap(true).net_deny_bind("9090"),
+    ] {
+        let policy = builder.build().unwrap();
+        assert_eq!(policy.bind_allow_layer(false), None);
+    }
+}
+
+#[test]
+fn bind_allow_layer_combined_policy_when_net_tcp_active() {
+    // With NetTcp active the combined allow-minus-deny bind policy stays
+    // enforced on the on-behalf path; deny-only bind has no allow layer
+    // and the wildcard stays unrestricted.
+    let combined = Sandbox::builder()
+        .net_allow_bind("8080")
+        .net_deny_bind("9090")
+        .build()
+        .unwrap();
+    assert_eq!(
+        combined.bind_allow_layer(true),
+        Some(BindPorts::Ports(vec![8080]))
+    );
+
+    let default_policy = Sandbox::builder().build().unwrap();
+    assert_eq!(
+        default_policy.bind_allow_layer(true),
+        Some(BindPorts::Ports(vec![]))
+    );
+
+    let deny_only = Sandbox::builder().net_deny_bind("9090").build().unwrap();
+    assert_eq!(deny_only.bind_allow_layer(true), None);
+
+    let wildcard = Sandbox::builder().net_allow_bind("*").build().unwrap();
+    assert_eq!(wildcard.bind_allow_layer(true), Some(BindPorts::All));
+}
+
+#[test]
+fn disabled_net_tcp_reports_inactive_and_drops_bind_allow_layer() {
+    // Explicitly disabling NetTcp resolves to Disabled on any host ABI,
+    // and the resolved flag keeps the allow layer uninstalled even with
+    // an explicit allowlist and port remap active.
+    let policy = Sandbox::builder()
+        .disable(Protection::NetTcp)
+        .port_remap(true)
+        .net_allow_bind("8080")
+        .build()
+        .unwrap();
+    let net_tcp_active = policy
+        .active_protections()
+        .unwrap()
+        .into_iter()
+        .any(|(p, s)| p == Protection::NetTcp && s == ProtectionStatus::Active);
+    assert!(!net_tcp_active);
+    assert_eq!(policy.bind_allow_layer(net_tcp_active), None);
+}
+
+#[test]
 fn builder_net_deny_rejects_hostname() {
     let err = Sandbox::builder().net_deny("evil.com:443").build();
     assert!(err.is_err());

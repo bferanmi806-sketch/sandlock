@@ -539,9 +539,9 @@ parse_ports([80, "443", "8000-8005"])
    together; a destination must match the allowlist and must not match the
    denylist. The same precedence applies to `net_allow_bind` and
    `net_deny_bind` for TCP ports. `policy_fn` IP restrictions resolve with
-   legacy priority (per-PID override > live policy > static allowlist) and
-   the static denylist is always checked first, so a dynamic override can
-   never erase it.
+    legacy priority (per-PID override > live policy > static allowlist) and
+    the static denylist is applied after the allow verdict and always wins,
+    so a dynamic override can never erase it.
 3. **Seccomp COW with `workdir`.** When `workdir` is set, the
    seccomp-based COW path intercepts writes under `workdir` and stages
    them in an upper layer, committed or aborted on exit per `on_exit` /

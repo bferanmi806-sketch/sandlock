@@ -452,8 +452,8 @@ impl CowState {
 /// The resolved allow and static deny layers applied to one destination.
 /// Allow is resolved with legacy `policy_fn` priority (per-PID override >
 /// live policy > static per-protocol allowlist); deny is always the static
-/// per-protocol denylist and is checked first, so a dynamic override can
-/// never erase it.
+/// per-protocol denylist, applied after the allow verdict, so a dynamic
+/// override can never erase it and deny always wins.
 #[derive(Debug, Clone)]
 pub(crate) struct NetworkPolicyLayers {
     /// Effective allow policy after legacy dynamic resolution.
@@ -540,8 +540,8 @@ impl NetworkState {
     /// override > live policy (when non-empty) > static per-protocol
     /// allowlist. PID/live overrides are IP-only — any port is permitted to
     /// listed IPs — and apply across all protocols. Deny is always the
-    /// static per-protocol denylist and is checked first by the verdict, so
-    /// a dynamic override can never erase it.
+    /// static per-protocol denylist, applied after the allow verdict with
+    /// deny always winning, so a dynamic override can never erase it.
     pub(crate) fn effective_network_policy(
         &self,
         tid: u32,
