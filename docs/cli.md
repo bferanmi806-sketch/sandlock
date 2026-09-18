@@ -56,9 +56,13 @@ sandlock run --net-allow udp://1.1.1.1:53 --net-allow tcp://:443 \
 # Ping: kernel ping socket (SOCK_DGRAM) gated by net.ipv4.ping_group_range
 sandlock run --net-allow icmp://github.com -r /usr -r /lib -r /etc -- ping github.com
 
-# Denylist: default-allow networking, block specific IPs/CIDRs/ports
-# (inverse of --net-allow; mutually exclusive with it). Port is optional.
+# Denylist: default-allow networking, block specific IPs/CIDRs/ports.
+# When combined with --net-allow, denied destinations win. Port is optional.
 sandlock run --net-deny 169.254.169.254 --net-deny 10.0.0.0/8 \
+  -r /usr -r /lib -r /etc -- python3 agent.py
+
+# Combined policy: allow HTTPS generally, except for the denied CIDR.
+sandlock run --net-allow ':443' --net-deny 10.0.0.0/8 \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
 # HTTP-level ACL (method + host + path rules via transparent proxy)

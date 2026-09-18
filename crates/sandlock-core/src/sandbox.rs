@@ -438,10 +438,12 @@ pub struct Sandbox {
     /// allow layer and therefore always wins.
     pub net_deny: Vec<NetDeny>,
     /// `--net-allow-bind`: TCP ports the sandbox may bind (default-deny
-    /// allowlist, Landlock-enforced when used alone; `All` leaves Landlock's
-    /// `BIND_TCP` hook unhandled so any port may be bound). Listing port `0`
-    /// authorizes only an ephemeral `bind(0)` request. When combined with
-    /// `net_deny_bind`, the supervisor enforces both layers.
+    /// allowlist, enforced by Landlock on the direct path and by the
+    /// on-behalf `bind()` handler under network supervision; `All` leaves
+    /// Landlock's `BIND_TCP` hook unhandled so any port may be bound).
+    /// Listing port `0` authorizes only an ephemeral `bind(0)` request.
+    /// When combined with `net_deny_bind`, the supervisor enforces both
+    /// layers and denied ports win.
     pub net_allow_bind: BindPorts,
     /// `--net-deny-bind`: TCP ports the sandbox may NOT bind (default-allow
     /// denylist, enforced on the on-behalf `bind()` path). When combined with
