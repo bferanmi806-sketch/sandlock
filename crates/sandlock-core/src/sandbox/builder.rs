@@ -954,7 +954,9 @@ impl SandboxBuilder {
         };
 
         // Parse user-supplied --net-allow specs. A scheme-less spec
-        // covers TCP and UDP, so one spec can yield two rules.
+        // covers TCP and UDP, so one spec can yield two rules. `net_allow`
+        // keeps only these explicit rules; HTTP reachability is generated at
+        // resolution time from the HTTP fields and merged at consumption.
         let mut net_allow: Vec<NetAllow> = Vec::new();
         for s in self.net_allow {
             net_allow.extend(NetRule::parse_allow(&s)?);
@@ -966,23 +968,10 @@ impl SandboxBuilder {
             net_deny.extend(NetRule::parse_deny(&s)?);
         }
 
-        // Keep the origin of net_allow separate from the parsed rules. HTTP
-        // ACL setup appends reachability rules below, but those generated
-        // rules must not turn an explicit deny-only policy into a combined
-        // allow/deny policy.
-        let net_allow_explicit = Some(!net_allow.is_empty());
-
         // Expand bind port specs. Both sides are retained; the supervisor
         // applies the denylist after the allowlist when both are present.
         let net_allow_bind = parse_allow_bind_ports(&self.net_allow_bind, "--net-allow-bind")?;
         let net_deny_bind = parse_bind_ports(&self.net_deny_bind, "--net-deny-bind")?;
-
-        crate::http::extend_net_allow_for_http(
-            &mut net_allow,
-            &http_allow,
-            &http_deny,
-            &http_ports,
-        );
 
         Ok(Sandbox {
             fs_writable: self.fs_writable,
@@ -1041,7 +1030,6 @@ impl SandboxBuilder {
             work_fn: self.work_fn,
             runtime: None,
             restore_skipped: Vec::new(),
-            net_allow_explicit,
         })
     }
 

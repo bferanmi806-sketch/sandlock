@@ -418,6 +418,11 @@ pub struct Sandbox {
     /// needs an explicit rule (`icmp://*` for any ICMP echo). TCP is
     /// always permitted.
     ///
+    /// Explicit outbound endpoint allowlist: only user `--net-allow` rules.
+    /// HTTP reachability is never stored here; it is generated at resolution
+    /// time from `http_allow`/`http_deny`/`http_ports` and merged only where
+    /// the rules are consumed.
+    ///
     /// Empty `net_allow` and empty `http_allow`/`http_deny` together
     /// mean "deny all outbound" (Landlock direct path denies, no
     /// on-behalf path is enabled). With `net_deny`, every matching
@@ -427,10 +432,10 @@ pub struct Sandbox {
     /// enforces these rules using the protocol, destination IP (or
     /// `host: None` = any IP), and destination port (N/A for ICMP).
     ///
-    /// HTTP rules with concrete hosts auto-add a matching
+    /// HTTP rules with concrete hosts generate a matching
     /// `(Tcp, host, [80])` (and `(Tcp, host, [443])` when `--http-ca`
-    /// is set) entry at build time so the proxy's intercept ports
-    /// remain reachable. HTTP rules with wildcard hosts auto-add
+    /// is set) entry at resolution time so the proxy's intercept ports
+    /// remain reachable. HTTP rules with wildcard hosts generate
     /// `(Tcp, None, [80])` instead.
     pub net_allow: Vec<NetAllow>,
     /// Parsed `--net-deny` rules (default-allow, IP/CIDR/port denylist).
@@ -584,44 +589,6 @@ pub struct Sandbox {
     // Runtime state: not serialized, not cloned.
     #[serde(skip)]
     restore_skipped: Vec<crate::checkpoint::SkippedFd>,
-
-    /// Whether the user supplied an outbound `net_allow` rule before HTTP ACL
-    /// reachability rules were appended. Serialized as the trailing bincode
-    /// field so direct `Sandbox` round trips preserve deny-only vs combined
-    /// mode; legacy blobs without the trailing byte deserialize to `None`
-    /// and are inferred as deny-only whenever `net_deny` is present. The same
-    /// value is also mirrored in checkpoint `meta.json` for older images.
-    #[serde(default, deserialize_with = "deserialize_trailing_net_allow_explicit")]
-    pub(crate) net_allow_explicit: Option<bool>,
-}
-
-/// Deserialize the trailing `net_allow_explicit` flag, tolerating legacy
-/// `policy.dat` blobs that end before it. Bincode serializes structs as a
-/// tuple in field order, so a blob written before the flag existed simply
-/// hits EOF here; map-based formats (JSON) use `#[serde(default)]`.
-fn deserialize_trailing_net_allow_explicit<'de, D>(d: D) -> Result<Option<bool>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-    match Option::<bool>::deserialize(d) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            // Legacy `policy.dat` blobs end before this trailing flag. Only
-            // an end-of-input failure falls back to `None` (legacy inference);
-            // any other decoding error still fails closed.
-            let msg = e.to_string().to_lowercase();
-            if msg.contains("eof")
-                || msg.contains("unexpected end")
-                || msg.contains("failed to fill")
-                || msg.contains("not enough data")
-            {
-                Ok(None)
-            } else {
-                Err(e)
-            }
-        }
-    }
 }
 
 impl std::fmt::Debug for Sandbox {
@@ -714,7 +681,6 @@ impl Clone for Sandbox {
             runtime: None,
             // Restore diagnostics belong to the original's run, not the clone.
             restore_skipped: Vec::new(),
-            net_allow_explicit: self.net_allow_explicit,
         }
     }
 }
@@ -729,18 +695,37 @@ impl Sandbox {
         self.extra_allow_syscalls.iter().any(|s| s == "sysv_ipc")
     }
 
-    /// Whether the parsed outbound allow rules are an active runtime layer.
+    /// HTTP-derived reachability rules, generated at resolution time from the
+    /// HTTP ACL fields. Never stored in `net_allow`; merged only where the
+    /// rules are consumed.
+    pub(crate) fn http_net_allow_rules(&self) -> Vec<NetAllow> {
+        crate::http::http_net_allow_rules(&self.http_allow, &self.http_deny, &self.http_ports)
+    }
+
+    /// Explicit plus HTTP-derived allow rules, in that order. Used only where
+    /// the rules are consumed (resolution, Landlock port gates, virtual hosts).
+    /// The mode itself is derived from the separated configuration via
+    /// [`Self::net_allow_is_active`].
+    pub(crate) fn effective_net_allow(&self) -> Vec<NetAllow> {
+        let mut out = self.net_allow.clone();
+        out.extend(self.http_net_allow_rules());
+        out
+    }
+
+    /// Whether the outbound allow rules are an active runtime layer.
     ///
-    /// HTTP ACL setup appends internal reachability rules to `net_allow`. A
-    /// deny-only policy must ignore those generated rules, while a legacy
-    /// checkpoint has no origin marker and is inferred as deny-only whenever
-    /// `net_deny` is present.
+    /// Derived from the separated configuration: explicit `--net-allow` rules
+    /// always activate the layer; HTTP-derived reachability activates it only
+    /// for non-deny policies (HTTP-only stays a restrictive allowlist, while
+    /// deny-only+HTTP stays default-allow with the HTTP proxy on top).
     pub fn net_allow_is_active(&self) -> bool {
-        if self.net_deny.is_empty() {
-            !self.net_allow.is_empty()
-        } else {
-            self.net_allow_explicit.unwrap_or(false)
+        if !self.net_allow.is_empty() {
+            return true;
         }
+        if !self.net_deny.is_empty() {
+            return false;
+        }
+        !self.http_net_allow_rules().is_empty()
     }
 
     /// Whether bind handling has a default-deny allow layer. A deny-only bind
@@ -1844,15 +1829,18 @@ impl Sandbox {
 
         let pipes = PipePair::new().map_err(SandboxRuntimeError::Io)?;
 
-        let resolved_net_allow = network::resolve_net_allow(&self.net_allow)
+        // Explicit rules plus HTTP-derived reachability, merged only here.
+        // `net_allow` itself keeps only explicit user rules.
+        let effective_net_allow = self.effective_net_allow();
+        let resolved_net_allow = network::resolve_net_allow(&effective_net_allow)
             .await
             .map_err(SandboxRuntimeError::Io)?;
         // In chroot/image mode, seed the synthetic /etc/hosts from the
         // rootfs's own file so entries baked into the image (private
         // registries, internal hostnames, etc.) survive virtualization.
         // Without a chroot, the helper returns the fixed loopback base.
-        // Either way, concrete-host rules from `net_allow` are appended
-        // on top.
+        // Either way, concrete-host rules (explicit plus HTTP-derived) are
+        // appended on top.
         let virtual_etc_hosts = network::compose_virtual_etc_hosts(
             self.chroot.as_deref(),
             &resolved_net_allow.concrete_host_entries,
@@ -2197,7 +2185,7 @@ impl Sandbox {
             net_state.icmp_deny_policy = resolved_deny.icmp;
 
             if self.net_allow_is_active() {
-                let no_rules = self.net_allow.is_empty();
+                let no_rules = effective_net_allow.is_empty();
                 let policy_from = |resolved: &network::ResolvedNetAllow| {
                     if no_rules || resolved.any_ip_all_ports {
                         crate::seccomp::notif::NetworkPolicy::Unrestricted

@@ -370,10 +370,11 @@ HTTP-level access control via a transparent MITM proxy.
 
 When `http_allow` or `http_deny` is non-empty, the supervisor spawns
 the proxy and redirects matching ports to it. HTTP rules with concrete
-hosts auto-extend `net_allow` with the corresponding TCP entry on each
-entry of `http_ports` (and on `443` when `http_ca` is set). Wildcard
-hosts auto-add `:80` (and `:443` when `http_ca` is set). All
-auto-added entries are TCP.
+hosts generate the corresponding TCP reachability entry on each entry of
+`http_ports` (and on `443` when `http_ca` is set) at resolution time.
+Wildcard hosts generate `:80` (and `:443` when `http_ca` is set). All
+generated entries are TCP and are merged only at enforcement; they are
+never stored in `net_allow`.
 
 ## `[syscalls]`
 
@@ -551,9 +552,10 @@ parse_ports([80, "443", "8000-8005"])
    Landlock rules, renaming or hard-linking it returns `EXDEV`, and
    nothing about it is reverted on abort.
 3. **HTTP host auto-expansion.** HTTP rules referencing concrete hosts
-   auto-add corresponding TCP entries on `http_ports` (and on `443`
-   when `http_ca` is set). Wildcard hosts add the equivalent any-IP
-   entries. All auto-added entries are TCP.
+   generate corresponding TCP reachability entries on `http_ports` (and on
+   `443` when `http_ca` is set) at resolution time. Wildcard hosts generate
+   the equivalent any-IP entries. All generated entries are TCP and are
+   merged only at enforcement.
 4. **TOCTOU and `policy_fn`.** Path strings are never exposed on
    policy events because seccomp user notification re-reads
    user-memory pointers after `Continue`. Path-based control belongs

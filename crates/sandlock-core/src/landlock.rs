@@ -302,12 +302,14 @@ pub fn compute_fs_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
 /// covers every port we drop `CONNECT_TCP` from the handled set (the
 /// on-behalf path is then the sole enforcer).
 ///
-/// Outbound modes: deny-only (`net_deny` present, no explicit `net_allow`)
-/// forces the wildcard treatment because every TCP connect must reach the
-/// on-behalf DenyList enforcer. A combined policy with a finite allowlist
-/// keeps `CONNECT_TCP` handled so Landlock still gates ports; a combined
-/// policy whose allowlist covers every TCP port drops it like an
-/// allow-only wildcard.
+/// Outbound modes, derived from the separated configuration:
+/// deny-only (`net_deny` present, no explicit `net_allow` and no
+/// HTTP-only allow layer) forces the wildcard treatment because every TCP
+/// connect must reach the on-behalf DenyList enforcer. A combined policy
+/// with a finite allowlist keeps `CONNECT_TCP` handled so Landlock still
+/// gates ports; a combined policy whose allowlist covers every TCP port
+/// drops it like an allow-only wildcard. HTTP-derived reachability never
+/// uses the all-ports form, so it never forces the wildcard by itself.
 ///
 /// Returns `(0, false)` when `Protection::NetTcp` is not `Active`
 /// (either disabled by policy or degraded on a kernel that does not
@@ -332,7 +334,7 @@ pub fn compute_net_mask(
     }
     use crate::sandbox::Protocol;
     let allow_all_ports = sandbox
-        .net_allow
+        .effective_net_allow()
         .iter()
         .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
     let deny_only = !sandbox.net_deny.is_empty() && !sandbox.net_allow_is_active();
@@ -578,7 +580,10 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
     // Skip — the on-behalf path is the sole enforcer.
     if handle_net && net_tcp_active && !net_wildcard {
         let mut connect_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
-        for rule in &policy.net_allow {
+        // Explicit rules plus HTTP-derived reachability; HTTP intercept ports
+        // are also added below (derived ports are a subset of them, kept here
+        // so the gate stays in sync with the resolved allowlist).
+        for rule in policy.effective_net_allow().iter() {
             // TCP-only — see net_wildcard comment above.
             if rule.protocol != Protocol::Tcp {
                 continue;
@@ -870,6 +875,67 @@ mod mask_contract_tests {
             mask & LANDLOCK_ACCESS_NET_CONNECT_TCP,
             0,
             "combined wildcard must drop CONNECT_TCP",
+        );
+    }
+
+    #[test]
+    fn net_mask_http_only_keeps_connect_tcp() {
+        // HTTP-only has no explicit allow rules but generates a finite
+        // reachability rule; it stays a restrictive allowlist so Landlock
+        // still gates CONNECT_TCP.
+        let pol = ProtectionPolicy::strict_all();
+        let sb = Sandbox::builder()
+            .http_allow("GET api.example.com/v1/*")
+            .build()
+            .expect("http-only sandbox builds");
+        assert!(sb.net_allow.is_empty());
+        assert!(sb.net_allow_is_active());
+        let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert!(!wildcard, "http-only finite must not force the connect wildcard");
+        assert_eq!(
+            mask,
+            LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            "http-only keeps both TCP hooks",
+        );
+    }
+
+    #[test]
+    fn net_mask_deny_only_http_stays_wildcard() {
+        // Deny-only + HTTP stays default-allow: HTTP reachability must not
+        // promote it to combined.
+        let pol = ProtectionPolicy::strict_all();
+        let sb = Sandbox::builder()
+            .net_deny("10.0.0.0/8")
+            .http_allow("GET api.example.com/v1/*")
+            .build()
+            .expect("deny-only+http sandbox builds");
+        assert!(sb.net_allow.is_empty());
+        assert!(!sb.net_allow_is_active());
+        let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert!(wildcard, "deny-only+http must set the wildcard flag");
+        assert_eq!(
+            mask,
+            LANDLOCK_ACCESS_NET_BIND_TCP,
+            "deny-only+http must drop CONNECT_TCP",
+        );
+    }
+
+    #[test]
+    fn net_mask_combined_http_keeps_connect_tcp() {
+        let pol = ProtectionPolicy::strict_all();
+        let sb = Sandbox::builder()
+            .net_allow("127.0.0.1:443")
+            .net_deny("10.0.0.0/8")
+            .http_allow("GET api.example.com/v1/*")
+            .build()
+            .expect("combined+http sandbox builds");
+        assert!(sb.net_allow_is_active());
+        let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert!(!wildcard, "combined+http finite must not force the connect wildcard");
+        assert_eq!(
+            mask,
+            LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            "combined+http keeps both TCP hooks",
         );
     }
 

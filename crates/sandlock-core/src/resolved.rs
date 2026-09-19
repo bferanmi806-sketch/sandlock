@@ -46,9 +46,9 @@ pub(crate) struct SandboxFeatures {
     pub(crate) http_acl: bool,
     pub(crate) argv_safety_required: bool,
     pub(crate) sysv_ipc_allowed: bool,
-    /// Whether an outbound allow layer is active. This intentionally ignores
-    /// HTTP-generated reachability rules when an explicit deny-only policy was
-    /// built.
+    /// Whether an outbound allow layer is active. Derived from the separated
+    /// configuration (explicit allow rules plus HTTP reachability, with
+    /// deny-only+HTTP staying default-allow).
     pub(crate) net_allow_present: bool,
     pub(crate) net_deny: bool,
 }
@@ -60,7 +60,9 @@ impl SandboxFeatures {
         handler_syscalls: &[i64],
     ) -> Self {
         let http_acl = !sandbox.http_allow.is_empty() || !sandbox.http_deny.is_empty();
+        let http_reachability = !sandbox.http_net_allow_rules().is_empty();
         let network_destination_policy = !sandbox.net_allow.is_empty()
+            || http_reachability
             || !sandbox.net_deny.is_empty()
             || sandbox.policy_fn.is_some()
             || http_acl;

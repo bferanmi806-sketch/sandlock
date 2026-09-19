@@ -1547,10 +1547,10 @@ async fn test_combined_hostname_resolving_into_denied_cidr_refused() {
     assert_eq!(got, "ERR:111", "hostname allow resolving into a denied CIDR must be refused; got {got:?}");
 }
 
-/// Deny-only plus HTTP-generated allow rules must retain deny-only network
-/// semantics: the generated `net_allow` reachability entries must not promote
-/// the policy to combined. A live listener on an address outside both the
-/// HTTP allow host and the denylist must still connect.
+/// Deny-only plus HTTP reachability must retain deny-only network semantics:
+/// HTTP-derived rules live outside `net_allow` and must not promote the
+/// policy to combined. A live listener on an address outside both the HTTP
+/// allow host and the denylist must still connect.
 #[tokio::test]
 async fn test_deny_only_with_http_allow_stays_deny_only() {
     let listener = TcpListener::bind("127.0.0.2:0").unwrap();
@@ -1562,7 +1562,8 @@ async fn test_deny_only_with_http_allow_stays_deny_only() {
         .http_allow("GET 127.0.0.1/*")
         .build()
         .unwrap();
-    assert!(!policy.net_allow_is_active(), "HTTP-generated rules must not activate the allow layer");
+    assert!(policy.net_allow.is_empty(), "HTTP reachability must stay out of net_allow");
+    assert!(!policy.net_allow_is_active(), "HTTP reachability must not activate the allow layer");
 
     let result = policy.clone()
         .run_interactive(&["python3", "-c", &connect_script(port, "127.0.0.2", &out)])

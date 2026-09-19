@@ -306,51 +306,84 @@ fn builder_combines_net_allow_and_net_deny() {
     let policy = policy.unwrap();
     assert_eq!(policy.net_allow.len(), 2);
     assert_eq!(policy.net_deny.len(), 2);
-    assert_eq!(policy.net_allow_explicit, Some(true));
+    assert!(policy.net_allow_is_active());
 }
 
 #[test]
-fn builder_keeps_http_generated_allow_rules_out_of_deny_only_mode() {
+fn builder_keeps_http_reachability_out_of_net_allow() {
+    // `net_allow` holds only explicit rules; HTTP reachability is generated
+    // at resolution time and merged only at consumption sites.
     let policy = Sandbox::builder()
         .net_deny("10.0.0.0/8")
         .http_allow("GET api.example.com/v1/*")
         .build()
         .unwrap();
-    assert!(!policy.net_allow.is_empty());
-    assert_eq!(policy.net_allow_explicit, Some(false));
+    assert!(policy.net_allow.is_empty());
     assert!(!policy.net_allow_is_active());
+    assert_eq!(policy.effective_net_allow().len(), 1);
 }
 
 #[test]
-fn outbound_mode_marker_survives_policy_bincode_round_trip() {
+fn builder_http_only_stays_restrictive_allowlist() {
     let policy = Sandbox::builder()
-        .net_allow("127.0.0.1:443")
-        .net_deny("10.0.0.0/8")
+        .http_allow("GET api.example.com/v1/*")
         .build()
         .unwrap();
+    assert!(policy.net_allow.is_empty());
+    assert!(policy.net_deny.is_empty());
     assert!(policy.net_allow_is_active());
-    let bytes = bincode::serialize(&policy).unwrap();
-    let restored: Sandbox = bincode::deserialize(&bytes).unwrap();
-    assert_eq!(restored.net_allow_explicit, Some(true));
-    assert!(restored.net_allow_is_active());
+    assert_eq!(policy.effective_net_allow().len(), 1);
 }
 
 #[test]
-fn outbound_mode_marker_legacy_blob_infers_deny_only() {
-    // Simulate a `policy.dat` written before the trailing flag existed by
-    // truncating it. Deserialization must succeed and infer deny-only.
+fn builder_deny_only_http_stays_default_allow() {
     let policy = Sandbox::builder()
-        .net_allow("127.0.0.1:443")
         .net_deny("10.0.0.0/8")
+        .http_allow("GET 127.0.0.1/*")
         .build()
         .unwrap();
-    let mut bytes = bincode::serialize(&policy).unwrap();
-    // Trailing flag is `Some(true)` = tag 1 + value 1; drop those bytes.
-    assert!(bytes.len() >= 2);
-    bytes.truncate(bytes.len() - 2);
-    let restored: Sandbox = bincode::deserialize(&bytes).unwrap();
-    assert_eq!(restored.net_allow_explicit, None);
-    assert!(!restored.net_allow_is_active());
+    assert!(policy.net_allow.is_empty());
+    assert!(!policy.net_allow_is_active());
+    // Reachability is still generated for the proxy, but the allow layer
+    // stays inactive so non-denied egress remains allowed.
+    assert_eq!(policy.effective_net_allow().len(), 1);
+}
+
+#[test]
+fn builder_combined_http_merges_at_resolution_time() {
+    let policy = Sandbox::builder()
+        .net_allow("github.com:443")
+        .net_deny("10.0.0.0/8")
+        .http_allow("GET api.example.com/v1/*")
+        .build()
+        .unwrap();
+    // 2 explicit rules (scheme-less expands to TCP+UDP); HTTP derived is separate.
+    assert_eq!(policy.net_allow.len(), 2);
+    assert!(policy.net_allow_is_active());
+    assert_eq!(policy.effective_net_allow().len(), 3);
+}
+
+#[test]
+fn outbound_mode_survives_policy_bincode_round_trip() {
+    for builder in [
+        Sandbox::builder()
+            .net_allow("127.0.0.1:443")
+            .net_deny("10.0.0.0/8"),
+        Sandbox::builder()
+            .net_deny("10.0.0.0/8")
+            .http_allow("GET api.example.com/v1/*"),
+        Sandbox::builder().http_allow("GET api.example.com/v1/*"),
+    ] {
+        let policy = builder.build().unwrap();
+        let expected_active = policy.net_allow_is_active();
+        let expected_effective = policy.effective_net_allow().len();
+        let bytes = bincode::serialize(&policy).unwrap();
+        let restored: Sandbox = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(restored.net_allow_is_active(), expected_active);
+        assert_eq!(restored.effective_net_allow().len(), expected_effective);
+        assert_eq!(restored.net_allow.len(), policy.net_allow.len());
+        assert_eq!(restored.net_deny.len(), policy.net_deny.len());
+    }
 }
 
 #[test]

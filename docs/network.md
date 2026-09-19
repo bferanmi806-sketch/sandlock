@@ -121,10 +121,11 @@ allow-all.
 
 **HTTP / HTTPS interception.** `--http-allow` / `--http-deny` route
 matching ports through a transparent proxy. Each rule with a concrete
-host auto-extends `--net-allow` with `host:80` (and `host:443` when
-`--http-ca` is set) so the proxy's intercept ports are reachable;
-wildcard hosts auto-add `:80` / `:443` (any IP). All auto-added
-entries are TCP. HTTPS MITM is enabled two ways: pass `--http-ca <cert>`
+host generates a `host:80` reachability rule (and `host:443` when
+`--http-ca` is set) at resolution time so the proxy's intercept ports
+are reachable; wildcard hosts generate `:80` / `:443` (any IP). All
+generated entries are TCP and are merged only at enforcement; they are
+never stored in `--net-allow`. HTTPS MITM is enabled two ways: pass `--http-ca <cert>`
 and `--http-key <key>` to bring your own CA, or pass `--http-inject-ca
 <bundle>` to have sandlock generate an ephemeral CA (private key in
 memory only) and splice its public cert into each named trust bundle at
@@ -159,7 +160,7 @@ the denylist on the on-behalf seccomp `bind()` path instead.
 
 ```bash
 # HTTP-level ACL (method + host + path rules via transparent proxy)
-# HTTP rules with concrete hosts auto-extend --net-allow with host:80,443
+# HTTP rules generate host:80,443 reachability at resolution time (not stored in --net-allow)
 sandlock run \
   --http-allow "GET docs.python.org/*" \
   --http-allow "POST api.openai.com/v1/chat/completions" \

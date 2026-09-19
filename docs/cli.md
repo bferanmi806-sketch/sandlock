@@ -66,7 +66,7 @@ sandlock run --net-allow ':443' --net-deny 10.0.0.0/8 \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
 # HTTP-level ACL (method + host + path rules via transparent proxy)
-# HTTP rules with concrete hosts auto-extend --net-allow with host:80,443
+# HTTP rules generate host:80,443 reachability at resolution time (not stored in --net-allow)
 sandlock run \
   --http-allow "GET docs.python.org/*" \
   --http-allow "POST api.openai.com/v1/chat/completions" \

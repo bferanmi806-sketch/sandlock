@@ -52,9 +52,6 @@ struct MetaJson {
     cow_snapshot: Option<String>,
     #[serde(default)]
     version: u32,
-    /// Optional because older checkpoint images did not record policy mode.
-    #[serde(default)]
-    net_allow_explicit: Option<bool>,
 }
 
 /// JSON schema for process/info.json.
@@ -120,7 +117,6 @@ impl Checkpoint {
             name: self.name.clone(),
             cow_snapshot: self.cow_snapshot.as_ref().map(|p| p.display().to_string()),
             version: IMAGE_VERSION,
-            net_allow_explicit: self.policy.net_allow_explicit,
         })?;
 
         // policy.dat (bincode -- complex struct, not human-readable anyway)
@@ -214,12 +210,7 @@ impl Checkpoint {
         // policy.dat
         let policy_bytes = std::fs::read(dir.join("policy.dat"))
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-        let mut policy: Sandbox = bincode::deserialize(&policy_bytes).map_err(io_err)?;
-        // The mode flag is now the trailing `policy.dat` field; `meta.json`
-        // only backfills legacy images whose blob predates it.
-        if policy.net_allow_explicit.is_none() {
-            policy.net_allow_explicit = meta.net_allow_explicit;
-        }
+        let policy: Sandbox = bincode::deserialize(&policy_bytes).map_err(io_err)?;
 
         // app_state.bin
         let app_state_path = dir.join("app_state.bin");
@@ -343,16 +334,17 @@ mod tests {
         assert!(msg.contains("version"), "error should mention version, got: {msg}");
     }
 
-    #[test]
-    fn image_stores_outbound_mode_in_policy_bincode_and_metadata() {
-        let dir = std::env::temp_dir().join(format!("sandlock-mode-{}", std::process::id()));
+    fn round_trip_policy(policy: Sandbox) -> Sandbox {
+        let dir = std::env::temp_dir().join(format!(
+            "sandlock-mode-{}-{}",
+            std::process::id(),
+            // Nanos Erbatur to avoid collisions when tests run in parallel.
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
-        let policy = Sandbox::builder()
-            .net_allow("127.0.0.1:443")
-            .net_deny("10.0.0.0/8")
-            .build()
-            .unwrap();
-        assert!(policy.net_allow_is_active());
         let checkpoint = Checkpoint {
             name: "mode-test".into(),
             policy,
@@ -363,17 +355,57 @@ mod tests {
         };
 
         checkpoint.save(&dir).unwrap();
-        let policy_bytes = std::fs::read(dir.join("policy.dat")).unwrap();
-        let policy_from_bincode: Sandbox = bincode::deserialize(&policy_bytes).unwrap();
-        assert_eq!(policy_from_bincode.net_allow_explicit, Some(true));
-        assert!(
-            std::fs::read_to_string(dir.join("meta.json"))
-                .unwrap()
-                .contains("\"net_allow_explicit\": true")
-        );
-
         let loaded = Checkpoint::load(&dir).unwrap();
-        assert!(loaded.policy.net_allow_is_active());
         let _ = std::fs::remove_dir_all(&dir);
+        loaded.policy
+    }
+
+    #[test]
+    fn image_round_trip_preserves_combined_policy_without_origin_flag() {
+        let policy = Sandbox::builder()
+            .net_allow("127.0.0.1:443")
+            .net_deny("10.0.0.0/8")
+            .build()
+            .unwrap();
+        // Only explicit rules are stored; HTTP fields are empty here.
+        assert_eq!(policy.net_allow.len(), 2);
+        assert!(policy.net_allow_is_active());
+        let loaded = round_trip_policy(policy);
+        assert_eq!(loaded.net_allow.len(), 2);
+        assert_eq!(loaded.net_deny.len(), 2);
+        assert!(loaded.net_allow_is_active());
+    }
+
+    #[test]
+    fn image_round_trip_preserves_deny_only_http_as_default_allow() {
+        let policy = Sandbox::builder()
+            .net_deny("10.0.0.0/8")
+            .http_allow("GET api.example.com/v1/*")
+            .build()
+            .unwrap();
+        // HTTP reachability is not stored in net_allow.
+        assert!(policy.net_allow.is_empty());
+        assert!(!policy.net_allow_is_active());
+        assert_eq!(policy.http_allow.len(), 1);
+        let loaded = round_trip_policy(policy);
+        assert!(loaded.net_allow.is_empty());
+        assert!(!loaded.net_allow_is_active());
+        assert_eq!(loaded.http_allow.len(), 1);
+        // Regenerated at resolution time, not persisted.
+        assert_eq!(loaded.effective_net_allow().len(), 1);
+    }
+
+    #[test]
+    fn image_round_trip_preserves_http_only_as_restrictive_allowlist() {
+        let policy = Sandbox::builder()
+            .http_allow("GET api.example.com/v1/*")
+            .build()
+            .unwrap();
+        assert!(policy.net_allow.is_empty());
+        assert!(policy.net_allow_is_active());
+        let loaded = round_trip_policy(policy);
+        assert!(loaded.net_allow.is_empty());
+        assert!(loaded.net_allow_is_active());
+        assert!(!loaded.effective_net_allow().is_empty());
     }
 }
