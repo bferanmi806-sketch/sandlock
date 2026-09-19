@@ -28,7 +28,12 @@ use crate::sandbox::Sandbox;
 // text) that were never captured into `memory/`. Each `memory/<start_hex>.bin`
 // is re-associated with its map entry by matching start address.
 
-const IMAGE_VERSION: u32 = 2;
+// v3: `Sandbox.net_allow` holds only explicit user rules; HTTP reachability
+// is regenerated at resolution time. v2 images may contain HTTP-derived
+// rules inside `net_allow`, which v3 would misread as explicit rules
+// (e.g. deny-only+HTTP loading as combined), so v2 is rejected outright
+// with no compatibility fallback (pre-1.0 policy).
+const IMAGE_VERSION: u32 = 3;
 
 fn io_err(e: impl std::fmt::Display) -> SandlockError {
     SandlockError::Runtime(SandboxRuntimeError::Child(e.to_string()))
@@ -332,6 +337,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let msg = res.unwrap_err().to_string();
         assert!(msg.contains("version"), "error should mention version, got: {msg}");
+    }
+
+    #[test]
+    fn image_rejects_v2_http_mixed_net_allow() {
+        // Upstream v2 checkpoints may store HTTP-derived reachability inside
+        // `net_allow`. The separated representation would misread those as
+        // explicit rules (deny-only+HTTP loading as combined), so v2 is
+        // rejected outright with no fallback.
+        let dir = std::env::temp_dir().join(format!("sandlock-v2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("process/threads")).unwrap();
+        std::fs::create_dir_all(dir.join("process/memory")).unwrap();
+        std::fs::write(dir.join("meta.json"),
+            br#"{"name":"x","cow_snapshot":null,"version":2}"#).unwrap();
+        let res = Checkpoint::load(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("version") && msg.contains('2'),
+            "v2 image must be rejected as unsupported version, got: {msg}"
+        );
     }
 
     fn round_trip_policy(policy: Sandbox) -> Sandbox {
